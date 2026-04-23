@@ -1,6 +1,6 @@
 import asyncio
 import flet as ft
-import json, os, re, subprocess
+import json, os, re, shlex, subprocess, sys
 from datetime import datetime
 
 # ── Material Design 3 · Teal · Light ─────────────────────────
@@ -32,7 +32,12 @@ def save_data(records):
 
 def parse_text(text: str):
     cmd = re.search(r"(claude\s+--resume\s+[a-f0-9-]+)", text)
-    d   = re.search(r"PS\s+([A-Za-z]:[^>]+)>", text)
+    # Windows PowerShell:  PS C:\path>
+    d = re.search(r"PS\s+([A-Za-z]:[^>]+)>", text)
+    # macOS / Linux shell: /path/to/dir$ 或 ~/path$
+    if not d:
+        d = re.search(r"(?:^|\n)((?:/|~)[^\n$#]*?)(?:\s*[\(\[].*?[\)\]])?\s*[$#]",
+                      text, re.MULTILINE)
     if cmd and d:
         return {
             "time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -42,39 +47,78 @@ def parse_text(text: str):
     return None
 
 
-# ── 原生对话框（PowerShell WinForms，无需 tkinter）──────────
-def _ps_run(script: str, timeout: int = 120) -> str:
-    r = subprocess.run(
-        ["powershell", "-NonInteractive", "-Command", script],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    return r.stdout.strip()
+# ── 跨平台原生对话框 / 剪贴板 ────────────────────────────────
+def _run(args: list, timeout: int = 120) -> str:
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _try_cmds(cmds: list, timeout: int = 120) -> str:
+    for args in cmds:
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except FileNotFoundError:
+            continue
+    return ""
 
 
 def _ps_save_dialog() -> str:
-    return _ps_run(
-        "Add-Type -AssemblyName System.Windows.Forms;"
-        "$d = New-Object System.Windows.Forms.SaveFileDialog;"
-        "$d.Title = '导出数据库';"
-        "$d.Filter = 'JSON 文件|*.json';"
-        "$d.FileName = 'claude_sessions_backup.json';"
-        "$d.DefaultExt = 'json';"
-        "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
-    )
+    if sys.platform == "win32":
+        return _run(["powershell", "-NonInteractive", "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$d = New-Object System.Windows.Forms.SaveFileDialog;"
+            "$d.Title = '导出数据库';"
+            "$d.Filter = 'JSON 文件|*.json';"
+            "$d.FileName = 'claude_sessions_backup.json';"
+            "$d.DefaultExt = 'json';"
+            "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"])
+    elif sys.platform == "darwin":
+        return _run(["osascript", "-e",
+            'POSIX path of (choose file name with prompt "导出数据库" '
+            'default name "claude_sessions_backup.json")'])
+    else:
+        return _try_cmds([
+            ["zenity", "--file-selection", "--save", "--confirm-overwrite",
+             "--title=导出数据库", "--filename=claude_sessions_backup.json",
+             "--file-filter=JSON files | *.json"],
+            ["kdialog", "--getsavefilename", "claude_sessions_backup.json", "*.json"],
+        ])
 
 
 def _ps_open_dialog() -> str:
-    return _ps_run(
-        "Add-Type -AssemblyName System.Windows.Forms;"
-        "$d = New-Object System.Windows.Forms.OpenFileDialog;"
-        "$d.Title = '导入数据库';"
-        "$d.Filter = 'JSON 文件|*.json';"
-        "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
-    )
+    if sys.platform == "win32":
+        return _run(["powershell", "-NonInteractive", "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$d = New-Object System.Windows.Forms.OpenFileDialog;"
+            "$d.Title = '导入数据库';"
+            "$d.Filter = 'JSON 文件|*.json';"
+            "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"])
+    elif sys.platform == "darwin":
+        return _run(["osascript", "-e",
+            'POSIX path of (choose file with prompt "导入数据库" '
+            'of type {"json", "public.json"})'])
+    else:
+        return _try_cmds([
+            ["zenity", "--file-selection", "--title=导入数据库",
+             "--file-filter=JSON files | *.json"],
+            ["kdialog", "--getopenfilename", ".", "*.json"],
+        ])
 
 
 def _ps_clipboard() -> str:
-    return _ps_run("Get-Clipboard", timeout=10)
+    if sys.platform == "win32":
+        return _run(["powershell", "-NonInteractive", "-Command", "Get-Clipboard"],
+                    timeout=10)
+    elif sys.platform == "darwin":
+        return _run(["pbpaste"], timeout=10)
+    else:
+        return _try_cmds([
+            ["xclip", "-selection", "clipboard", "-o"],
+            ["xsel",  "--clipboard", "--output"],
+            ["wl-paste"],
+        ], timeout=10)
 
 
 async def run_in_thread(fn):
@@ -284,11 +328,37 @@ def main(page: ft.Page):
     def do_execute(e):
         rec = selected_rec[0]
         if not rec: snack("请先点击选择一条记录", ERROR); return
-        cmd = f'Set-Location -Path "{rec["directory"]}"; {rec["command"]}'
-        subprocess.Popen(
-            ["powershell", "-NoExit", "-Command", cmd],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-        )
+        d, cmd = rec["directory"], rec["command"]
+
+        if sys.platform == "win32":
+            subprocess.Popen(
+                ["powershell", "-NoExit", "-Command",
+                 f'Set-Location -Path "{d}"; {cmd}'],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+        elif sys.platform == "darwin":
+            shell = f"cd {shlex.quote(d)} && {cmd}"
+            escaped = shell.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen([
+                "osascript",
+                "-e", f'tell application "Terminal" to do script "{escaped}"',
+                "-e",  'tell application "Terminal" to activate',
+            ])
+        else:
+            shell = f"cd {shlex.quote(d)} && {cmd}; exec bash"
+            launched = False
+            for term in [
+                ["gnome-terminal", "--", "bash", "-c", shell],
+                ["xfce4-terminal", "-e", f"bash -c {shlex.quote(shell)}"],
+                ["konsole", "--noclose", "-e", "bash", "-c", shell],
+                ["xterm", "-e", f"bash -c {shlex.quote(shell)}"],
+            ]:
+                try:
+                    subprocess.Popen(term); launched = True; break
+                except FileNotFoundError:
+                    continue
+            if not launched:
+                snack("未找到可用终端模拟器", ERROR)
 
     # ── Delete ────────────────────────────────────────────────
     def do_delete(e):
