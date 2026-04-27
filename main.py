@@ -30,21 +30,95 @@ def save_data(records):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_UUID = r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
+
+
+def _normalize(text: str) -> str:
+    text = _ANSI_RE.sub("", text or "")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _extract_uuid(text: str):
+    for pat in (
+        r"claude\s+--resume\s+(" + _UUID + r")",
+        r"/resume\s+(" + _UUID + r")",
+        _UUID,                                     # 裸 UUID 兜底
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1) if m.lastindex else m.group(0)
+    return None
+
+
+def _strip_ps_provider(p: str) -> str:
+    """剥掉 PowerShell provider 前缀，例如
+       'Microsoft.PowerShell.Core\\FileSystem::\\\\server\\share' -> '\\\\server\\share'
+    """
+    if "::" in p:
+        p = p.split("::", 1)[1]
+    return p.strip()
+
+
+def _extract_directory(text: str):
+    # 1) Windows PowerShell 完整提示符（含 provider 前缀 & UNC）：
+    #    PS C:\path>   /   PS Microsoft.PowerShell.Core\FileSystem::\\server\share>
+    #    /   PS \\server\share\path>
+    m = re.search(r"PS\s+([^\n>]+?)\s*>", text)
+    if m:
+        cand = _strip_ps_provider(m.group(1))
+        if cand:
+            return cand
+    # 2) 裸 Windows 路径 + > （含 UNC 与 provider）
+    m = re.search(r"(?:^|\n)\s*((?:[A-Za-z]:\\|\\\\|[\w.\\]+::)[^\n>]+?)\s*>", text)
+    if m:
+        return _strip_ps_provider(m.group(1))
+    # 3) 单独一行的 Windows / UNC 路径
+    m = re.search(r"(?:^|\n)\s*((?:[A-Za-z]:\\|\\\\)[^\n]+?)\s*$",
+                  text, re.MULTILINE)
+    if m: return m.group(1).strip()
+    # 4) Unix shell:  /path$  ~/path#  /path (branch)$
+    m = re.search(r"(?:^|\n)((?:/|~)[^\n$#]*?)(?:\s*[\(\[].*?[\)\]])?\s*[$#]",
+                  text, re.MULTILINE)
+    if m: return m.group(1).strip()
+    # 5) cwd: <path>
+    m = re.search(r"cwd\s*[:=]\s*(\S+)", text, re.IGNORECASE)
+    if m: return m.group(1).strip()
+    # 6) cd "<path>"  /  cd <path>
+    m = re.search(
+        r"\bcd\s+[\"']?([A-Za-z]:[^\"'\n]+|\\\\[^\"'\n]+|/[^\"'\n]+|~[^\"'\n]+)[\"']?",
+        text)
+    if m: return m.group(1).strip()
+    return None
+
+
 def parse_text(text: str):
-    cmd = re.search(r"(claude\s+--resume\s+[a-f0-9-]+)", text)
-    # Windows PowerShell:  PS C:\path>
-    d = re.search(r"PS\s+([A-Za-z]:[^>]+)>", text)
-    # macOS / Linux shell: /path/to/dir$ 或 ~/path$
-    if not d:
-        d = re.search(r"(?:^|\n)((?:/|~)[^\n$#]*?)(?:\s*[\(\[].*?[\)\]])?\s*[$#]",
-                      text, re.MULTILINE)
-    if cmd and d:
+    text = _normalize(text)
+    uuid = _extract_uuid(text)
+    directory = _extract_directory(text)
+    if uuid and directory:
         return {
             "time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "directory": d.group(1).strip(),
-            "command":   cmd.group(1).strip(),
+            "directory": directory,
+            "command":   f"claude --resume {uuid}",
         }
     return None
+
+
+def parse_diagnose(text: str) -> str:
+    """保存失败时给出具体原因，便于用户排查。"""
+    text = _normalize(text)
+    if not text.strip():
+        return "内容为空"
+    has_uuid = _extract_uuid(text) is not None
+    has_dir  = _extract_directory(text) is not None
+    if not has_uuid and not has_dir:
+        return "未识别到 UUID 和目录路径"
+    if not has_uuid:
+        return "未识别到 UUID（需要 36 位 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）"
+    if not has_dir:
+        return "未识别到目录路径（如 PS C:\\path> 或 /path$）"
+    return "格式无法识别"
 
 
 # ── 跨平台原生对话框 / 剪贴板 ────────────────────────────────
@@ -145,14 +219,18 @@ def main(page: ft.Page):
     selected_rec = [None]
 
     # ── SnackBar ──────────────────────────────────────────────
-    _snack = ft.SnackBar(ft.Text(""), bgcolor=PRIMARY)
-    page.overlay.append(_snack)
-
+    # 每次新建一个 SnackBar 加到 overlay，避免 open=True→True 不再触发动画
     def snack(msg: str, color: str = PRIMARY):
-        _snack.content = ft.Text(msg, color=ON_PRIMARY, weight=ft.FontWeight.W_500)
-        _snack.bgcolor  = color
-        _snack.open     = True
+        sb = ft.SnackBar(
+            content=ft.Text(msg, color=ON_PRIMARY, weight=ft.FontWeight.W_500),
+            bgcolor=color,
+        )
+        page.overlay.append(sb)
+        sb.open = True
         page.update()
+        # overlay 累积太多会拖慢 UI，保留最近 8 个
+        if len(page.overlay) > 8:
+            page.overlay[:] = page.overlay[-8:]
 
     # ── Paste area ────────────────────────────────────────────
     paste_tf = ft.TextField(
@@ -175,7 +253,8 @@ def main(page: ft.Page):
         _do_save()
 
     def _do_save():
-        rec = parse_text(paste_tf.value or "")
+        text = paste_tf.value or ""
+        rec  = parse_text(text)
         if rec:
             records.append(rec)
             save_data(records)
@@ -183,7 +262,7 @@ def main(page: ft.Page):
             refresh_table()
             snack(f"已保存  {rec['time']}")
         else:
-            snack("格式无法识别，请检查内容", ERROR)
+            snack(parse_diagnose(text), ERROR)
         page.update()
 
     def do_save(e): _do_save()
@@ -331,9 +410,10 @@ def main(page: ft.Page):
         d, cmd = rec["directory"], rec["command"]
 
         if sys.platform == "win32":
+            # 用 -LiteralPath 避免路径里的 [ ] * ? 被当作通配，也兼容 UNC \\server\share
             subprocess.Popen(
                 ["powershell", "-NoExit", "-Command",
-                 f'Set-Location -Path "{d}"; {cmd}'],
+                 f'Set-Location -LiteralPath "{d}"; {cmd}'],
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
         elif sys.platform == "darwin":
